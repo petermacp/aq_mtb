@@ -1,0 +1,517 @@
+---
+title: "Blantyre Air Quality Modelling"
+output: html_notebook
+---
+
+Load required libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(brms)
+library(tidybayes)
+library(sf)
+library(mgcv)
+library(priorsense)
+library(osmdata)
+library(nngeo) 
+```
+
+
+Import the modelling dataset - cleaned and prepped in the `2025-05-12_aq_clean.Rmd` script
+
+```{r}
+
+aq_model_data <- read_rds("input_data/aq_model_data.rds")
+
+#also load the scale clusters
+load("input_data/scale_72_clusters.rda") #SCALE clusters
+
+#and the grid data
+mw_100m_cropped <- read_rds("input_data/mw_100m_cropped.rds")
+mw_100m_grid_sf <- read_rds("input_data/mw_100m_grid_sf.rds")
+
+
+```
+
+
+### Model 1:
+
+
+"We fitted a spatially smooth regression model for log-transformed PM2.5 concentrations using a Gaussian process (GP) smooth over spatial coordinates (x, y) to capture flexible spatial trends. Seasonal variation was modelled using a Fourier series expansion of day-of-year up to the 3rd harmonic (i.e., sine and cosine terms for annual, semi-annual, and tri-annual cycles) to account for complex seasonal patterns. The model was fitted in a Bayesian framework using brms with a Gaussian likelihood and the cmdstanr backend."
+
+Note, priors are still causing issues for me, so we will comment out now, and use the defauly stan weakly informative priors
+
+Priors
+
+```{r, fig.width=12, fig.height=12}
+
+priors <- c(
+  prior(normal(3.4, 1), class = "Intercept"),
+  prior(normal(0,1), class = "b"),
+  prior(exponential(1), class = "sigma"),
+  prior(exponential(1), class = "sdgp"),
+  prior(normal(0, 1), class = "lscale", lb = 0)
+)
+
+```
+
+Fit prior only model
+
+```{r, fig.width=12, fig.height=12}
+
+m1_prior <- brm(
+    formula = log_pm2_5 ~ gp(x, y, k=15) +
+      sin_doy1 + cos_doy1 +
+      sin_doy2 + cos_doy2 +
+      sin_doy3 + cos_doy3,
+    data = aq_model_data,
+    family = gaussian(),
+    prior = priors,
+    sample_prior = "only",
+    chains = 4, cores = 4,
+    backend = "cmdstanr"
+  )
+
+
+summary(m1_prior)
+plot(m1_prior)
+
+```
+
+Now model with data.
+
+
+```{r, fig.width=12, fig.height=12}
+m1 <- brm(
+    formula = log_pm2_5 ~ gp(x, y, k=15)  +
+    sin_doy1 + cos_doy1 +
+    sin_doy2 + cos_doy2 +
+    sin_doy3 + cos_doy3,
+    data = aq_model_data,
+    family = gaussian(),
+    prior = priors,
+    chains = 4, cores = 4,
+    backend = "cmdstanr"
+  )
+
+summary(m1)
+conditional_effects(m1)
+pp_check(m1)
+plot(m1)
+
+```
+
+Compare prior-only model to model with data using `priorsense` package:
+
+```{r, fig.width=12, fig.height=12}
+
+m1_draws <- as_draws_df(m1)
+
+# Extract prior and posterior draws
+powerscale_sensitivity(m1, variable = c("b_Intercept", 
+                                        "b_sin_doy1", "b_cos_doy1",
+                                        "b_sin_doy2", "b_cos_doy2",
+                                        "b_sin_doy3", "b_cos_doy3",
+                                        "sdgp_gpxy", "sigma", "Intercept"))
+
+powerscale_plot_dens(m1, variable = c("b_Intercept", 
+                                        "b_sin_doy1", "b_cos_doy1",
+                                        "b_sin_doy2", "b_cos_doy2",
+                                        "b_sin_doy3", "b_cos_doy3",
+                                        "sdgp_gpxy", "sigma", "Intercept"))
+```
+
+Predictions by space and time. Here, although we only have data within clusters, we will predict for cells outside of clusters based on covariates.
+We will also predict for the month for whcih we do not have data.
+
+```{r, fig.width=12, fig.height=12}
+
+#set_up prediction date frame
+nd_m1 <- st_as_sf(mw_100m_cropped)  %>%
+  mutate(centroid = st_centroid(geometry)) %>%
+  mutate(x = st_coordinates(centroid)[, 1],
+         y = st_coordinates(centroid)[, 2]) %>%
+  select(-centroid)  %>%
+  st_drop_geometry() %>%
+  rename(pop_density = 1) %>%
+  mutate(pop_density_km2 = pop_density / 0.01)
+
+#get the first day of each month for prediction
+first_days <- ymd(paste0("2020-", sprintf("%02d", 1:12), "-01"))
+first_day_doy <- yday(first_days)
+
+#calculate Fourier terms
+first_day_seasonality <- tibble(
+  mean_doy = first_day_doy,
+  sin_doy1 = sin(2 * pi * mean_doy / 365.25),
+  cos_doy1 = cos(2 * pi * mean_doy / 365.25),
+  sin_doy2 = sin(4 * pi * mean_doy / 365.25),
+  cos_doy2 = cos(4 * pi * mean_doy / 365.25),
+  sin_doy3 = sin(6 * pi * mean_doy / 365.25),
+  cos_doy3 = cos(6 * pi * mean_doy / 365.25),
+  date = first_days
+)
+
+#expand grid for prediction
+nd_m1 <- nd_m1 %>%
+  crossing(first_day_seasonality)
+
+#take posterior draws - note storing as an rvars object for efficiency
+#note can only manage this without crashing computer!
+#to address later, and improve efficieny for more draws
+m1_draws <- add_epred_rvars(object = m1,
+                            newdata = nd_m1,
+                            ndraws = 500) 
+
+#now extract the summary mean and sd for each month-grid cell combination
+m1_epred_array <- posterior::draws_of(m1_draws$.epred)
+
+#compute posterior means per location
+m1_draws$.epred_mean <- colMeans(m1_epred_array)
+
+#compute posterior sds per location
+m1_draws$.epred_sd <- apply(m1_epred_array, 2, sd)
+
+m1_sum <- m1_draws %>% 
+  select(x, y, date, .epred_mean, .epred_sd)
+
+
+#plot predictions
+m1_sum %>%  
+  mutate(date = month(date, label=TRUE)) %>%
+  ggplot() +
+  geom_tile(aes(x = x, y=y, fill=.epred_mean)) +
+  geom_sf(data = scale_72_clusters, colour="grey78", fill=NA) +
+  scale_fill_viridis_c() +
+  facet_wrap(date~.) +
+  labs(title = "Log(PM2.5) exposure",
+       x="",
+       y="") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(fill=NA, colour="grey78"),
+        axis.text.x = element_text(angle = 45, hjust=1),
+        strip.background = element_rect(colour = "grey78"))
+
+```
+
+Now just draw 50 random coordinates, and predict by time to see whether we captured the trend.
+
+```{r, fig.width=12, fig.height=12}
+#sample coordinate points from the household dataset
+#we will fix the small number sampled later!
+set.seed(123) 
+sampled_points_m1 <- aq_model_data %>%
+  sample_n(50) %>%
+  select(x, y)
+
+#generate DOY 0–365 and calculate Fourier terms
+doy_grid <- tibble(doy = 0:365) %>%
+  mutate(
+    sin_doy1 = sin(2 * pi * doy / 365),
+    cos_doy1 = cos(2 * pi * doy / 365),
+    sin_doy2 = sin(4 * pi * doy / 365),
+    cos_doy2 = cos(4 * pi * doy / 365),
+    sin_doy3 = sin(6 * pi * doy / 365),
+    cos_doy3 = cos(6 * pi * doy / 365)
+  )
+
+#expand grid across sampled locations
+prediction_df_m1 <- sampled_points_m1 %>%
+  crossing(doy_grid)
+
+#add predictions
+preds_m1 <- add_epred_draws(object = m1, newdata = prediction_df_m1)
+
+#summarise
+preds_m1_sum <- preds_m1 %>%
+  ungroup() %>%
+  group_by(doy) %>%
+  summarise(.epred_mean = mean(.epred),
+            .lower = quantile(.epred, probs=0.025),
+            .upper = quantile(.epred, probs = 0.975))
+
+#GEt the observed data
+observed_data <- aq_model_data %>%
+  select(mean_doy, log_pm2_5) 
+
+#plot
+preds_m1_sum %>%
+  ggplot() +
+  geom_ribbon(aes(x=doy, ymin=.lower, ymax = .upper), fill="steelblue", alpha=0.3) +
+  geom_line(aes(x=doy, y=.epred_mean)) +
+  geom_jitter(data = observed_data, aes(x = mean_doy, y = log_pm2_5),
+              color = "darkred", alpha = 0.6, width = 0.5, height = 0.0, size = 1.2) +
+  labs(title = "Model-estimated log(PM2.5) with empirical measurements",
+       subtitle = "Model predictions with 95% CrI and observed data points",
+       x = "Day of year",
+       y = "log(PM2.5)",
+       caption = "Modelled estimates restricted to within clusters") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour = "grey78"),
+        legend.position = "none")
+
+```
+
+### Model 2: With covariates
+
+Now we include grid level covariates of distance to the road, population density, and building footprint percent, along witht the mean temp and huidity on the day of measurement (from the purple air monitors)
+
+Again, priors to be fixed later
+
+```{r, fig.width=12, fig.height=12}
+priors <- c(
+  prior(normal(3.4, 1), class = "Intercept"),
+  prior(normal(0,1), class = "b"),
+  prior(exponential(1), class = "sigma"),
+  prior(exponential(1), class = "sdgp"),
+  prior(normal(0, 1), class = "lscale", lb = 0)
+)
+
+
+m2 <- brm(
+    formula = log_pm2_5 ~ gp(x, y, k=15)  +
+      s(mean_temp_c, k=5) + 
+      s(mean_current_humidity, k=5) +
+      s(pop_density_km2, k=5) +
+      s(building_coverage_pct, k=5) +
+      s(dist_to_road_m, k=5) +
+      sin_doy1 + cos_doy1 +
+      sin_doy2 + cos_doy2 +
+      sin_doy3 + cos_doy3,
+    data = aq_model_data,
+    family = gaussian(),
+    prior = priors,
+    chains = 4, cores = 4,
+    backend = "cmdstanr"
+  )
+
+summary(m2)
+conditional_effects(m2)
+pp_check(m2)
+plot(m2)
+
+
+```
+
+```{r, fig.width=12, fig.height=12}
+
+m2_draws <- as_draws_df(m2)
+
+# Extract prior and posterior draws
+powerscale_sensitivity(m2, variable = c("b_Intercept", "b_sin_doy1", "b_cos_doy1", "b_sin_doy2", "b_cos_doy2", "b_sin_doy3", "b_cos_doy3", "bs_smean_temp_c_1", "bs_smean_current_humidity_1", "bs_spop_density_km2_1", "bs_sbuilding_coverage_pct_1", "bs_sdist_to_road_m_1",         
+"sds_smean_temp_c_1", "sds_smean_current_humidity_1", "sds_spop_density_km2_1", "sds_sbuilding_coverage_pct_1", 
+"sds_sdist_to_road_m_1", "sdgp_gpxy", "lscale_gpxy", "sigma", "Intercept", "s_smean_temp_c_1[1]", "s_smean_temp_c_1[2]", "s_smean_temp_c_1[3]",         "s_smean_current_humidity_1[1]",  "s_smean_current_humidity_1[2]",  "s_smean_current_humidity_1[3]",  "s_spop_density_km2_1[1]",       
+ "s_spop_density_km2_1[2]",        "s_spop_density_km2_1[3]",        "s_sbuilding_coverage_pct_1[1]",  "s_sbuilding_coverage_pct_1[2]", 
+ "s_sbuilding_coverage_pct_1[3]",  "s_sdist_to_road_m_1[1]", "s_sdist_to_road_m_1[2]", "s_sdist_to_road_m_1[3]"))
+
+powerscale_plot_dens(m2, variable = c("b_Intercept", "b_sin_doy1", "b_cos_doy1", "b_sin_doy2", "b_cos_doy2", "b_sin_doy3", "b_cos_doy3", "bs_smean_temp_c_1", "bs_smean_current_humidity_1", "bs_spop_density_km2_1", "bs_sbuilding_coverage_pct_1", "bs_sdist_to_road_m_1",         
+"sds_smean_temp_c_1", "sds_smean_current_humidity_1", "sds_spop_density_km2_1", "sds_sbuilding_coverage_pct_1", 
+"sds_sdist_to_road_m_1", "sdgp_gpxy", "lscale_gpxy", "sigma", "Intercept", "s_smean_temp_c_1[1]", "s_smean_temp_c_1[2]", "s_smean_temp_c_1[3]",         "s_smean_current_humidity_1[1]",  "s_smean_current_humidity_1[2]",  "s_smean_current_humidity_1[3]",  "s_spop_density_km2_1[1]",       
+ "s_spop_density_km2_1[2]",        "s_spop_density_km2_1[3]",        "s_sbuilding_coverage_pct_1[1]",  "s_sbuilding_coverage_pct_1[2]", 
+ "s_sbuilding_coverage_pct_1[3]",  "s_sdist_to_road_m_1[1]", "s_sdist_to_road_m_1[2]", "s_sdist_to_road_m_1[3]"))
+```
+
+Predictions by space and time
+
+```{r, fig.width=12, fig.height=12}
+
+#first we need a prediction dataframe with all of the covariate data
+
+#extract month from date variable
+aq_model_data <- aq_model_data  %>%
+  mutate(month = lubridate::month(as.Date(mean_doy, origin = "2019-12-31")))
+
+#calculate monthly means
+monthly_means <- aq_model_data %>%
+  group_by(month) %>%
+  summarise(
+    mean_temp_c = mean(mean_temp_c, na.rm = TRUE),
+    mean_current_humidity = mean(mean_current_humidity, na.rm = TRUE)
+  )
+
+#No data collection in April - here we will just interpolate
+#can do better later...
+march_temp <- monthly_means %>% filter(month == 3) %>% pull(mean_temp_c)
+may_temp <- monthly_means %>% filter(month == 5) %>% pull(mean_temp_c)
+april_temp <- (march_temp + may_temp) / 2
+
+march_humidity <- monthly_means %>% filter(month == 3) %>% pull(mean_current_humidity)
+may_humidity <- monthly_means %>% filter(month == 5) %>% pull(mean_current_humidity)
+april_humidity <- (march_humidity + may_humidity) / 2
+
+#add these into the prediction dataframe
+monthly_means <- monthly_means %>%
+  add_row(month=4, 
+          mean_temp_c = april_temp,
+          mean_current_humidity = april_humidity) %>%
+  arrange(month)
+
+#set_up prediction date frame
+nd_m2 <- mw_100m_grid_sf %>%
+  sf::st_sf() %>%
+  mutate(x = st_coordinates(st_centroid(.))[, 1],
+         y = st_coordinates(st_centroid(.))[, 2]) %>%
+  st_drop_geometry() %>%
+  rename(pop_density = 1) %>%
+  mutate(pop_density_km2 = pop_density / 0.01)
+
+#get the first day of each month for prediction
+first_days <- ymd(paste0("2020-", sprintf("%02d", 1:12), "-01"))
+first_day_doy <- yday(first_days)
+
+#calculate Fourier terms
+first_day_seasonality <- tibble(
+  mean_doy = first_day_doy,
+  sin_doy1 = sin(2 * pi * mean_doy / 365.25),
+  cos_doy1 = cos(2 * pi * mean_doy / 365.25),
+  sin_doy2 = sin(4 * pi * mean_doy / 365.25),
+  cos_doy2 = cos(4 * pi * mean_doy / 365.25),
+  sin_doy3 = sin(6 * pi * mean_doy / 365.25),
+  cos_doy3 = cos(6 * pi * mean_doy / 365.25),
+  date = first_days
+) %>%
+  mutate(month = lubridate::month(as.Date(mean_doy, origin = "2019-12-31"))) %>%
+  left_join(monthly_means)
+
+nd_m2 <- nd_m2 %>%
+  crossing(first_day_seasonality) %>%
+  mutate(building_coverage_pct = building_coverage_pct/100)
+
+#take posterior draws - note storing as an rvars object for efficiency
+m2_draws <- add_epred_rvars(object = m2,
+                            newdata = nd_m2,
+                            ndraws = 200) #note can only manage this without crashing computer!
+
+#now extract the summary mean and sd for each month-grid cell combination
+m2_epred_array <- posterior::draws_of(m2_draws$.epred)
+
+#compute posterior means per location
+m2_draws$.epred_mean <- colMeans(m2_epred_array)
+
+#compute posterior sd per location
+m2_draws$.epred_sd <- apply(m2_epred_array, 2, sd)
+
+m2_sum <- m2_draws %>% 
+  select(x, y, date, .epred_mean, .epred_sd)
+
+
+#plot predictions
+m2_sum %>%  
+  mutate(date = month(date, label = TRUE)) %>%
+  mutate(.epred_mean = exp(.epred_mean)) %>%
+  ggplot() +
+  geom_tile(aes(x = x, y=y, fill=.epred_mean)) +
+  geom_sf(data = scale_72_clusters, colour="grey78", fill=NA) +
+  #geom_sf(data = main_roads_cropped, colour="white") + #roads looking a bit messy when plotted - work on this.
+  scale_fill_scico(palette = "acton",
+    trans = scales::log_trans(base = 10), name = "Predicted\nPM2.5") +
+  facet_wrap(date~.) +
+  labs(title = "Log(PM2.5) exposure",
+       x="",
+       y="",
+       caption = "White boundaries are SCALE study clusters") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(fill=NA, colour="grey78"),
+        strip.background = element_rect(colour = "grey78"),
+        axis.text.x = element_text(angle=90, hjust=1),
+        legend.position = "bottom")
+
+#plot sd
+m2_sum %>%  
+  mutate(date = month(date, label = TRUE)) %>%
+  ggplot() +
+  geom_tile(aes(x = x, y=y, fill=.epred_sd)) +
+  geom_sf(data = scale_72_clusters, colour="grey78", fill=NA) +
+  #geom_sf(data = main_roads_cropped, colour="white") +
+  scale_fill_viridis_c(option = "F") +
+  facet_wrap(date~.) +
+  labs(title = "Log(PM2.5) exposure",
+       x="",
+       y="",
+       caption = "White boundaries are SCALE study clusters") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(fill=NA, colour="grey78"),
+        strip.background = element_rect(colour = "grey78"),
+        axis.text.x = element_text(angle=90, hjust=1))
+
+```
+
+Sample coordinates, and plot over time
+
+```{r, fig.width=12, fig.height=12}
+
+#sample coordinate points
+#will sort out the small number later
+set.seed(123)
+sampled_points_m2 <- aq_model_data %>%
+  sample_n(50) %>%
+  select(x, y, mean_temp_c, mean_current_humidity, pop_density_km2, building_coverage_pct, dist_to_road_m, grid_id, log_pm2_5)
+
+#generate DOY 0–365 and calculate Fourier terms
+doy_grid <- tibble(doy = seq(0,365, by=1)) %>%
+  mutate(
+    sin_doy1 = sin(2 * pi * doy / 365),
+    cos_doy1 = cos(2 * pi * doy / 365),
+    sin_doy2 = sin(4 * pi * doy / 365),
+    cos_doy2 = cos(4 * pi * doy / 365),
+    sin_doy3 = sin(6 * pi * doy / 365),
+    cos_doy3 = cos(6 * pi * doy / 365)
+  )
+
+#expand grid across sampled locations
+prediction_df_m2 <- sampled_points_m2 %>%
+  crossing(doy_grid)
+
+#add predictions
+preds_m2 <- add_epred_draws(object = m2, newdata = prediction_df_m2, ndraws = 100)
+
+#observed data for plotting
+observed_data <- aq_model_data %>%
+  select(mean_doy, log_pm2_5) %>%
+  mutate(mean_doy = round(mean_doy))
+
+#plot
+preds_m2 %>%
+  ungroup() %>%
+  ggplot(aes(x=doy)) +
+  stat_lineribbon(aes(y=.epred), .width=0.95) + 
+  geom_jitter(data = observed_data, aes(x = mean_doy, y = log_pm2_5),
+              color = "darkred", alpha = 0.6, width = 0.5, height = 0.0, size = 1.2) +
+  scale_fill_brewer() +
+  labs(title = "Model-estimated log(PM2.5) with empirical measurements",
+       subtitle = "Model predictions with 95% CrI and observed data points",
+       x = "Day of year",
+       y = "log(PM2.5)",
+       caption = "Modelled estimates restricted to within clusters") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour = "grey78"),
+        legend.position = "none")
+
+
+
+```
+
+
+Compare models, using LOO CV
+
+```{r}
+
+library(loo)
+
+loo_m1 <- loo(m1)
+loo_m2 <- loo(m2)
+
+loo_compare(loo_m1, loo_m2)
+```
+
+
+TODO
+
+ - OTHER OUTCOME MEASURES (PM1, PM10, NO)
+ - CAN WE LINK TO THE STATIC AQ MONITORS (OUTDOORS)
+ - PRIORS
+ - OTHER COVARIATES
+ - COMPARE MODELS WITH DIFFERENT BASIS FUNCTIONS FOR GP AND SPLINES
+ - EXCEEDANCES
+ - LINK TO MTB INFECTION PREVALENCE DATA, AND MODEL
