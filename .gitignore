@@ -2,3 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+epred_chunks_m1
+nd_m1.parquet
+epred_chunks_m2
+nd_m2.parquet
