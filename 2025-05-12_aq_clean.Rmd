@@ -1,0 +1,352 @@
+---
+title: "Blantyre air quality modelling"
+output:
+  html_document:
+    df_print: paged
+---
+
+Load required libraries
+
+```{r}
+library(tidyverse)
+library(here)
+library(brms)
+library(tidybayes)
+library(sf)
+library(mgcv)
+library(priorsense)
+library(osmdata)
+library(nngeo) 
+library(stars)
+library(concaveman)
+```
+
+
+### Air quality data
+
+By summary, a random household survey was conducted in Blantyre Malawi during 2019-2020 (pre-COVID in Malawi) as part of a TB cluster randomised trial  pre-intervention prevalence survey (sumamrised here: https://europepmc.org/article/MED/37862284). Fieldworkers carried purple air monitors attached to their backpacks, with measurements set to read every 90 seconds. Not all fieldworkers had a monitor. Previously, Helen Savage cleaned these monitor data, and merged to household questionnaire data, filtering measurements by interview times. Therefore, measurements are indoor household measurements.
+
+Cluster boundaries (72 in total) are based on Ministry of Health Community Health Worker catchment areas, refined in collaboration with researchers. These were the unit of randomisation for the SCALE cluster randomised trial.
+
+All air quality measurements were then taken from households within the 72 SCALE cluster.
+
+```{r}
+load("input_data/aq_in.RData") #cleaned air-quality dataset
+load("input_data/scale_72_clusters.rda") #SCALE clusters
+
+
+#set the coordinate system for scale clusters
+scale_72_clusters <- st_set_crs(scale_72_clusters, st_crs(4326))
+proj_crs <- 4326  # UTM zone 35S
+scale_proj <- st_transform(scale_72_clusters, crs = proj_crs)
+```
+
+Get data into correct shape and aggregate measurements per household. Note as purple air devices took measurements every 90 seconds, mostly housholds surveyed have multiple measurements. Here, for convenience, we take the mean of these measurement per household.
+
+```{r, fig.width=12, fig.height=12}
+aq_dat <- aq_in %>%
+  select(datetime, h02cl_id, hh_id, hh_lat, hh_lon, temp_c, current_humidity, mean_pm_2_5, distance_km) %>%
+ mutate(
+   datetime = ymd_hms(datetime),
+   hour = hour(datetime) + minute(datetime)/60,
+   doy = yday(datetime),
+   x = hh_lon,
+   y = hh_lat) %>%
+  group_by(hh_id) %>%
+  reframe(h02cl_id = h02cl_id,
+          x = x,
+          y = y,
+          mean_doy = mean(doy, na.rm=TRUE),
+          mean_pm2_5 = mean(mean_pm_2_5), 
+          mean_temp_c = mean(temp_c, na.rm=TRUE),
+          mean_current_humidity = mean(current_humidity, na.rm=TRUE)) %>%
+  distinct() %>%
+  mutate(log_pm2_5 = log(mean_pm2_5))
+
+
+#we will use Fourier series components with multiple harmonics to model day-of-the year effects
+aq_dat <- aq_dat %>%
+  mutate(
+    sin_doy1 = sin(2 * pi * mean_doy / 365),
+    cos_doy1 = cos(2 * pi * mean_doy / 365),
+    sin_doy2 = sin(4 * pi * mean_doy / 365),
+    cos_doy2 = cos(4 * pi * mean_doy / 365),
+    sin_doy3 = sin(6 * pi * mean_doy / 365),
+    cos_doy3 = cos(6 * pi * mean_doy / 365)
+  )
+
+#check some variables
+aq_dat %>%
+  select(hh_id, log_pm2_5, mean_temp_c, mean_current_humidity, mean_doy) %>%
+  pivot_longer(cols = c(log_pm2_5, mean_temp_c, mean_current_humidity, mean_doy)) %>%
+  ggplot() +
+  geom_histogram(aes(x=value, fill=name)) +
+  facet_wrap(name~., scales = "free_x")
+
+#PM2.5 distribution by day of the year
+aq_dat %>%
+  ggplot() +
+  geom_jitter(aes(x = mean_doy, y=log_pm2_5), colour="darkred", alpha=0.5) +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour="grey78"))
+#Note that there was no data collection in April of either year
+
+
+#plot the measurements on a map
+aq_dat %>%
+  ggplot() +
+  geom_sf(data=scale_72_clusters, fill=NA) +
+  geom_point(aes(x=x, y=y, colour=log_pm2_5), size=0.1)+
+  scale_color_viridis_c() +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour="grey78")) 
+
+#Note the warning about old coordinate reference system - we will fix this below.
+
+```
+
+### Covariates
+
+Population counts and density
+
+Get the world pop data, and get a buffer around clusters/aq data
+
+```{r, fig.width=12, fig.height=12}
+
+#read in the .tiff image of population count from Worldpop
+#https://hub.worldpop.org/geodata/summary?id=1560
+mw_100m <- stars::read_stars("input_data/mwi_ppp_2020.tif")
+
+#what is the CRS?
+st_crs(mw_100m)
+
+#convert air quality data to sf object
+aq_sf <- st_as_sf(aq_dat, coords = c("x", "y"), crs = st_crs(proj_crs))
+
+# 2. Construct a minimal convex boundary around clusters
+concave_hull <- concaveman(aq_sf, concavity = 2) # Adjust concavity to fit your data
+buffered_concave <- st_buffer(concave_hull, dist = 1500)
+
+ggplot() +
+  geom_sf(data = buffered_concave) +
+  geom_sf(data = scale_72_clusters, colour="darkred") +
+  geom_sf(data = aq_sf)
+```
+
+Now crop the worldpop data
+
+```{r}
+mw_100m_cropped <- st_crop(mw_100m, buffered_concave)
+
+#mw_100m_masked <- buffered_concave[mw_100m_cropped]
+
+ggplot() +
+  stars::geom_stars(data = mw_100m_cropped) +
+  geom_sf(data = buffered_concave, fill = NA, colour = "darkred") +
+  scale_fill_viridis_c()
+
+
+########
+
+
+# 5. Replace NA values within the cropped area with 0
+#mw_100m_cropped[[1]][is.na(mw_100m_cropped[[1]])] <- 0
+
+# ggplot() +
+#   stars::geom_stars(data = mw_100m_cropped)
+
+# ggplot() +
+#   stars::geom_stars(data = mw_100m_cropped) +
+#   geom_sf(data = aq_sf, color = "black", size = 0.2) +
+#   geom_sf(data = buffered_hull, fill = NA, color = "red")
+
+#Convert `stars` grid to sf polygons
+mw_grid_sf <- st_as_sf(mw_100m_cropped, as_points = FALSE, merge = FALSE) %>%
+  mutate(grid_id = row_number()) %>%
+  rename(pop = 1)
+
+ggplot() +
+  geom_sf(data = mw_grid_sf,aes(fill=pop)) +
+  scale_fill_viridis_c()
+```
+
+Merge together population data to the air-quality data.
+
+```{r}
+
+#merge with the population count data
+aq_sf$pop <- stars::st_extract(mw_100m_cropped, aq_sf)[[1]]
+
+#get population density
+aq_model_data <- aq_sf %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  mutate(pop_density_km2 = pop / 0.01) %>%
+  left_join(aq_dat %>% select(hh_id, x, y))
+
+#check plot
+aq_sf %>%
+  ggplot() +
+    geom_sf(data = mw_grid_sf) +
+  geom_sf(aes(colour=pop_density))
+
+
+```
+
+Building density (i.e. we get the building footprints, and calculate their combined footprint area per grid cell, then calculate what percentage of the grid cell is "building footprint")
+https://sites.research.google/gr/open-buildings/#open-buildings-download 
+
+Using Version 2 here - can update later to V3, with better precision, and year-specific data. (I think this is for 2020 currently)
+
+(Buildings dataset is huge, so processing here, then importing. Preprocessing commented out.)
+
+```{r, fig.width=12, fig.height=12}
+
+#read in the data set
+#is a stars dataset
+buildings <- read_rds("input_data/blantyre_buff_buildings.rds")
+
+#match the crs to the population data
+buildings <-  st_transform(buildings, st_crs(proj_crs))
+
+#join building footprint data to the population data
+buildings_joined <- st_join(buildings, mw_grid_sf, join = st_within)
+
+
+#filter by confidence of building footprint, and by footprint size
+#in Hannah R's previous experiements, this was a good compromise
+#and matches well with home visits on the ground.
+buildings_joined <- buildings_joined %>%
+  filter(area_in_meters>20) %>%
+  filter(area_in_meters<400) %>%
+  filter(confidence>0.69)
+  
+
+#sum building footprint per grid cell
+building_area_per_cell <- buildings_joined %>%
+  group_by(grid_id) %>%
+  summarise(total_building_area_m2 = sum(area_in_meters, na.rm = TRUE))
+
+
+write_rds(building_area_per_cell, "input_data/building_area_per_cell.rds")
+
+building_area_per_cell <- read_rds("input_data/building_area_per_cell.rds")
+
+#cell area in m squared
+cell_area_m2 <- 100 * 100
+
+#compute percentage coverage
+building_area_per_cell <- building_area_per_cell %>%
+  mutate(building_coverage_pct = (total_building_area_m2 / cell_area_m2) * 100)
+
+#join
+mw_100m_grid_sf <- mw_grid_sf %>%
+  left_join(building_area_per_cell %>% st_drop_geometry(), by = "grid_id") %>%
+  mutate(building_coverage_pct = replace_na(building_coverage_pct, 0))
+
+#check by plotting
+mw_100m_grid_sf %>%
+  mutate(x = st_coordinates(st_centroid(.))[, 1],
+         y = st_coordinates(st_centroid(.))[, 2]) %>%
+  ggplot() +
+  geom_tile(aes(x=x, y=y, fill=building_coverage_pct)) +
+  scale_fill_viridis_c(option = "cividis") +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour = "grey78"))
+
+#Look at building footprints in one cluster
+
+cluster_buildings <- st_join(scale_72_clusters, buildings)
+
+ cluster_buildings$footprints_geom <- st_as_sfc(cluster_buildings$footprints, crs = st_crs(cluster_buildings))
+ st_geometry(cluster_buildings) <- "footprints_geom"
+
+ cluster_buildings %>%
+   filter(cluster =="c1") %>%
+   ggplot() +
+   geom_sf(fill = "mediumseagreen") +
+   geom_sf(data = scale_72_clusters %>% filter(cluster == "c1"), fill=NA)
+
+
+```
+
+Distance to the nearest main road. I.e. because we think that PM2.5 exposure can come from road vehicles.
+
+We use Open Street Map (OSM) data to get the main roads (there are few of these in Blantyre... but see the most traffic). Later could consider including some smaller road...
+
+```{r, fig.width=12, fig.height=12}
+
+bbox_vect <- st_bbox(buffered_concave)
+
+  #get the OSM features.
+q <- opq(bbox = bbox_vect) %>%
+  add_osm_feature(key = 'highway', 
+                  value = c('primary', 'secondary', 'tertiary', 
+                            'trunk', 'motorway'))
+
+#import
+osm_roads <- osmdata_sf(q)
+
+##get ready.
+main_roads <- osm_roads$osm_lines
+main_roads <- st_transform(main_roads, st_crs(proj_crs))
+
+#plot roads
+main_roads %>%
+  ggplot() +
+  geom_sf(data = scale_72_clusters, colour="darkred") +
+  geom_sf() 
+
+#crop to grid
+main_roads_cropped <- st_crop(main_roads, buffered_concave)
+
+#plot again.
+main_roads_cropped %>%
+  ggplot() +
+  geom_sf(data = scale_72_clusters, colour="darkred") +
+  geom_sf() 
+
+#get centroids of grid cells
+grid_centroids <- st_centroid(mw_100m_grid_sf)
+
+#use nearest neighbour search to get the distance from the grid cell centroid to the nearest main road.
+nearest_roads <- st_nn(grid_centroids, main_roads_cropped, k = 1, returnDist = TRUE)
+dist_to_road_m <- sapply(nearest_roads$dist, `[`, 1)
+
+#same as before: add to grid
+mw_100m_grid_sf$dist_to_road_m <- dist_to_road_m
+
+#check plot
+mw_100m_grid_sf %>%
+  mutate(x = st_coordinates(st_centroid(.))[, 1],
+         y = st_coordinates(st_centroid(.))[, 2]) %>%
+  ggplot() +
+  geom_tile(aes(x=x, y=y, fill=dist_to_road_m)) +
+  scale_fill_viridis_c(option = "G", direction = -1) +
+  theme(panel.background = element_rect(colour = "grey78")) +
+  theme_ggdist() +
+  theme(panel.background = element_rect(colour = "grey78"))
+
+
+
+```
+
+
+Join all together into the modelling dataset, and just last tidy-up.
+
+```{r, fig.width=12, fig.height=12}
+
+aq_model_data <- st_as_sf(aq_model_data, coords = c("x", "y"), crs = st_crs(proj_crs))
+
+aq_model_data <- st_join(aq_model_data, mw_100m_grid_sf)
+
+aq_model_data <- aq_model_data %>%
+  mutate(x = st_coordinates(st_centroid(.))[, 1],
+         y = st_coordinates(st_centroid(.))[, 2]) %>%
+  st_drop_geometry() %>%
+  mutate(building_coverage_pct = building_coverage_pct/100)
+
+write_rds(aq_model_data, "input_data/aq_model_data.rds")
+write_rds(mw_100m_cropped, "input_data/mw_100m_cropped.rds")
+write_rds(mw_100m_grid_sf, "input_data/mw_100m_grid_sf.rds")
+```
